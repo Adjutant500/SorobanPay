@@ -2595,3 +2595,134 @@ fn test_batch_failed_item_next_payment_not_advanced() {
     assert_eq!(t.mer_bal(), 0_i128,
         "merchant balance must be unchanged after a failed batch item");
 }
+
+// ─── Issue #1358 — SubscriptionAlreadyExists (error 21) ──────────────────────
+//
+// `transfer_subscription` must return `SubscriptionAlreadyExists` (21) when
+// the destination merchant already has an active subscription with the same
+// subscriber, preventing silent overwrites of live billing relationships.
+
+/// [1358-001] Transferring to a merchant that already has an active subscription
+/// with the same subscriber must return SubscriptionAlreadyExists (21).
+///
+/// Scenario:
+///   subscriber → old_merchant  (active)
+///   subscriber → new_merchant  (also active — collision!)
+/// Expected: `transfer_subscription` returns `Err(Ok(ContractError::SubscriptionAlreadyExists))`
+#[test]
+fn test_transfer_subscription_collision_returns_already_exists() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_700_000_000_u64);
+
+    let admin        = Address::generate(&env);
+    let subscriber   = Address::generate(&env);
+    let old_merchant = Address::generate(&env);
+    let new_merchant = Address::generate(&env);
+    let token        = env.register_stellar_asset_contract_v2(admin.clone()).address();
+
+    // Fund subscriber
+    StellarAssetClient::new(&env, &token).mint(&subscriber, &100_000_i128);
+
+    let contract_id = env.register(SubscriptionProtocol, ());
+    let client      = SubscriptionProtocolClient::new(&env, &contract_id);
+
+    // Approve a generous allowance for both subscriptions.
+    token::Client::new(&env, &token).approve(
+        &subscriber,
+        &contract_id,
+        &100_000_i128,
+        &(env.ledger().sequence() + 100_000_u32),
+    );
+
+    let amount   = 1_000_i128;
+    let interval = 86_400_u64;
+
+    // Create subscription with old_merchant.
+    client.subscribe(&subscriber, &old_merchant, &token, &amount, &interval, &false);
+
+    // Create an EXISTING subscription with new_merchant — this is the collision.
+    client.subscribe(&subscriber, &new_merchant, &token, &amount, &interval, &false);
+
+    // Attempting to transfer old_merchant → new_merchant must fail with
+    // SubscriptionAlreadyExists (21) because (subscriber, new_merchant) already exists.
+    let result = client.try_transfer_subscription(&subscriber, &old_merchant, &new_merchant);
+    assert!(
+        matches!(result, Err(Ok(ContractError::SubscriptionAlreadyExists))),
+        "transfer to a merchant with existing subscription must return \
+         SubscriptionAlreadyExists (21); got {:?}",
+        result
+    );
+
+    // Both original subscriptions must remain intact after the failed transfer.
+    assert!(
+        client
+            .get_subscription(&subscriber, &old_merchant, &token)
+            .is_some(),
+        "old_merchant subscription must still exist after failed transfer"
+    );
+    assert!(
+        client
+            .get_subscription(&subscriber, &new_merchant, &token)
+            .is_some(),
+        "new_merchant subscription must still exist after failed transfer"
+    );
+}
+
+/// [1358-002] Transferring to a merchant with NO existing subscription must succeed.
+///
+/// Sanity-check: the happy path must still work after the collision guard is in
+/// place.  After a successful transfer the old subscription is gone and the new
+/// one carries identical billing parameters.
+#[test]
+fn test_transfer_subscription_no_collision_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_700_000_000_u64);
+
+    let admin        = Address::generate(&env);
+    let subscriber   = Address::generate(&env);
+    let old_merchant = Address::generate(&env);
+    let new_merchant = Address::generate(&env);
+    let token        = env.register_stellar_asset_contract_v2(admin.clone()).address();
+
+    StellarAssetClient::new(&env, &token).mint(&subscriber, &100_000_i128);
+
+    let contract_id = env.register(SubscriptionProtocol, ());
+    let client      = SubscriptionProtocolClient::new(&env, &contract_id);
+
+    token::Client::new(&env, &token).approve(
+        &subscriber,
+        &contract_id,
+        &100_000_i128,
+        &(env.ledger().sequence() + 100_000_u32),
+    );
+
+    let amount   = 1_000_i128;
+    let interval = 86_400_u64;
+
+    // Only subscribe with old_merchant — new_merchant slot is empty.
+    client.subscribe(&subscriber, &old_merchant, &token, &amount, &interval, &false);
+
+    // Transfer must succeed with no collision.
+    let result = client.try_transfer_subscription(&subscriber, &old_merchant, &new_merchant);
+    assert!(
+        result.is_ok(),
+        "transfer to a merchant with no existing subscription must succeed; got {:?}",
+        result
+    );
+
+    // After transfer: old subscription gone, new subscription present.
+    assert!(
+        client
+            .get_subscription(&subscriber, &old_merchant, &token)
+            .is_none(),
+        "old_merchant subscription must be removed after successful transfer"
+    );
+    assert!(
+        client
+            .get_subscription(&subscriber, &new_merchant, &token)
+            .is_some(),
+        "new_merchant subscription must exist after successful transfer"
+    );
+}

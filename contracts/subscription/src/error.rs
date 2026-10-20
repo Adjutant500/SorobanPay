@@ -5,7 +5,7 @@ use soroban_sdk::contracterror;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ContractError {
-    // ── Core subscription errors (1–7) ──────────────────────────────────────
+    // ── Core subscription errors (1–11) ─────────────────────────────────────
     /// `subscribe` called with amount <= 0
     AmountMustBePositive  = 1,
     /// `subscribe` called with interval < 86400 seconds (1 day)
@@ -53,33 +53,39 @@ pub enum ContractError {
     SelfSubscription      = 10,
     /// `subscribe` called with `token` equal to the contract's own address
     InvalidTokenAddress   = 11,
-    AmountExceedsLimit    = 18,
-    GracePeriodActive     = 19,
-    /// `batch_execute_payment` called with an empty subscribers vector
-    EmptyBatch            = 13,
-    /// `batch_execute_payment` called with more than BATCH_MAX_SIZE (50) subscribers
-    BatchTooLarge         = 14,
+    /// Admin address not initialised; call `initialize` first
+    NotInitialized        = 12,
+    // ── Allowance / migration errors (15–17) ─────────────────────────────────
     /// `subscribe` called with allowance < amount in strict mode
     InsufficientAllowance = 15,
     /// `migrate` called when contract is already at the current schema version
     AlreadyMigrated       = 16,
     /// `migrate` called by an address that is not the stored admin
     NotAdmin              = 17,
-    /// Admin address not initialised; call `initialize` first
-    NotInitialized        = 17,
-    /// `transfer_subscription` called with old_merchant == new_merchant (no-op transfer)
-    SameMerchant          = 18,
-    /// `transfer_subscription` called but a subscription already exists for (subscriber, new_merchant)
-    SubscriptionAlreadyExists = 19,
+    // ── Extended subscription errors (18–20) ─────────────────────────────────
+    /// `subscribe` called with amount exceeding the configured max_amount limit
+    AmountExceedsLimit    = 18,
+    /// Subscription is within an active grace period
+    GracePeriodActive     = 19,
     /// `execute_payment` called while paused and not yet due to auto-resume, or
     /// `pause_subscription` called on a subscription that is already paused
-    SubscriptionPaused        = 20,
+    SubscriptionPaused    = 20,
+    // ── Transfer / batch errors (21–23) ──────────────────────────────────────
+    /// `transfer_subscription` called but a subscription already exists for (subscriber, new_merchant)
+    SubscriptionAlreadyExists = 21,
+    /// `batch_execute_payment` called with an empty subscribers vector
+    EmptyBatch            = 22,
+    /// `batch_execute_payment` called with more than BATCH_MAX_SIZE (50) subscribers
+    BatchTooLarge         = 23,
+    // ── Remaining errors (24–26) ─────────────────────────────────────────────
+    /// `transfer_subscription` called with old_merchant == new_merchant (no-op transfer)
+    SameMerchant          = 24,
     /// `resume_subscription` called on a subscription that is not currently paused
-    SubscriptionNotPaused     = 21,
+    SubscriptionNotPaused = 25,
     /// `execute_payment` detected that the same payment nonce was already executed (#1083).
     ///
     /// This error is returned when `execute_payment` is retried with a nonce that was
     /// previously committed to an execution marker in temporary storage.  The transfer
     /// is NOT repeated — the subscription state is left unchanged.
-    DuplicateExecution        = 22,
+    DuplicateExecution    = 26,
 }
