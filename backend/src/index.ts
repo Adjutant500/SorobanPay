@@ -1,266 +1,327 @@
 /**
- * SorobanPay Backend — Express application entry point.
+ * SorobanPay backend — main entry point.
  *
- * Registers routes, middleware, error handling, and starts the HTTP server.
- * Also bootstraps the IndexerService and WebhookWorker background tasks.
+ * Import order matters: tracing MUST be first so OpenTelemetry can patch
+ * all subsequently loaded modules (Express, http, Prisma).
  */
+import { initTracing } from './lib/tracing';
+initTracing();
 
-import express, { Request, Response, NextFunction } from 'express';
+import 'dotenv/config';
+import express from 'express';
 import cors from 'cors';
-import swaggerUi from 'swagger-ui-express';
-import { createSubscriptionsRouter } from './routes/subscriptions';
-import { createPaymentsRouter } from './routes/payments';
-import { IndexerService } from './services/indexer';
-import { WebhookWorker } from './workers/webhook';
-import { closePool } from './db/pool';
+import cron from 'node-cron';
+import { validateConfig } from './lib/config';
+import { EventIndexer } from './services/eventIndexer';
+import { PayoutSummaryGenerator } from './services/payoutSummaryGenerator';
+import { PaymentScheduler } from './services/paymentScheduler';
+import { createRetryScheduler } from './services/retryScheduler';
+import { retryQueue } from './services/retryQueue';
+import { startWebhookWorker, shutdownWebhookWorker } from './services/webhookQueue'; // BE-53
+import { apiLimiter } from './middleware/rateLimiter';
+import { versionMiddleware } from './middleware/versioning';
+import summariesRouter from './routes/summaries';
+import reconcileRouter from './routes/reconcile';
+import subscriptionsRouter from './routes/subscriptions';
+import webhooksRouter from './routes/webhooks';
+import notificationsRouter from './routes/notifications';
+import kycRouter from './routes/kyc';
+import versionRouter from './routes/version';
+import analyticsRouter from './routes/analytics';   // FE-50 / BE-52
+import reportsRouter from './routes/reports';        // BE-58: revenue reporting export
+import adminRouter from './routes/admin';
+import authRouter from './routes/auth';                        // BE-55: merchant auth
+import { buildHealthRouter } from './routes/health';
+import { requireMerchant } from './middleware/merchantAuth';  // BE-55: JWT guard
+import { reconcile } from './services/reconciler';
+import { PrismaSubscriptionDB, fetchChainEventsFromDB } from './services/reconciler';
+import { getPrometheusMetrics } from './services/metricsService';
+import retriesRouter from './routes/retries';
+import { startRetryWorker, shutdownRetryWorker } from './services/retryQueue';
 
-// ---------------------------------------------------------------------------
-// App setup
-// ---------------------------------------------------------------------------
+// ─── Migration startup guard (#1078) ─────────────────────────────────────────
 
-export function createApp(): express.Application {
-  const app = express();
-
-  app.use(cors());
-  app.use(express.json());
-
-  // Health check
-  app.get('/health', (_req: Request, res: Response) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-  });
-
-  // OpenAPI docs
-  const swaggerDocument = {
-    openapi: '3.0.0',
-    info: {
-      title: 'SorobanPay Backend API',
-      version: '1.0.0',
-      description:
-        'REST API for the SorobanPay recurring payments protocol. ' +
-        'Provides subscription and payment history for merchants.',
-    },
-    servers: [{ url: '/' }],
-    components: {
-      schemas: {
-        Subscription: {
-          type: 'object',
-          properties: {
-            id: { type: 'integer' },
-            subscriber: { type: 'string' },
-            merchant: { type: 'string' },
-            token: { type: 'string' },
-            amount: { type: 'string' },
-            interval_sec: { type: 'integer' },
-            next_payment: { type: 'string', format: 'date-time' },
-            status: {
-              type: 'string',
-              enum: ['active', 'overdue', 'expired', 'cancelled'],
-            },
-            overdue_since: { type: 'string', format: 'date-time', nullable: true },
-            created_at: { type: 'string', format: 'date-time' },
-            updated_at: { type: 'string', format: 'date-time' },
-          },
-        },
-        SubscriptionsResponse: {
-          type: 'object',
-          properties: {
-            data: {
-              type: 'array',
-              items: { $ref: '#/components/schemas/Subscription' },
-            },
-            pagination: { $ref: '#/components/schemas/PaginationMeta' },
-          },
-        },
-        Payment: {
-          type: 'object',
-          properties: {
-            id: { type: 'integer' },
-            tx_hash: { type: 'string' },
-            event_type: { type: 'string', enum: ['executed', 'failure', 'cancel'] },
-            subscriber: { type: 'string' },
-            merchant: { type: 'string' },
-            amount: { type: 'string' },
-            payment_nonce: { type: 'string', nullable: true },
-            ledger_seq: { type: 'integer', nullable: true },
-            occurred_at: { type: 'string', format: 'date-time' },
-          },
-        },
-        PaymentsResponse: {
-          type: 'object',
-          properties: {
-            data: {
-              type: 'array',
-              items: { $ref: '#/components/schemas/Payment' },
-            },
-            pagination: { $ref: '#/components/schemas/PaginationMeta' },
-          },
-        },
-        PaginationMeta: {
-          type: 'object',
-          properties: {
-            page: { type: 'integer' },
-            pageSize: { type: 'integer' },
-            total: { type: 'integer' },
-            totalPages: { type: 'integer' },
-          },
-        },
-      },
-    },
-    paths: {
-      '/subscriptions/{merchant}': {
-        get: {
-          summary: 'List subscriptions for a merchant',
-          tags: ['Subscriptions'],
-          parameters: [
-            {
-              in: 'path',
-              name: 'merchant',
-              required: true,
-              schema: { type: 'string' },
-              description: 'Merchant Stellar address',
-            },
-            {
-              in: 'query',
-              name: 'status',
-              schema: {
-                type: 'string',
-                enum: ['active', 'overdue', 'expired', 'cancelled'],
-              },
-            },
-            {
-              in: 'query',
-              name: 'page',
-              schema: { type: 'integer', minimum: 1, default: 1 },
-            },
-            {
-              in: 'query',
-              name: 'pageSize',
-              schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
-            },
-          ],
-          responses: {
-            '200': {
-              description: 'Paginated subscriptions',
-              content: {
-                'application/json': {
-                  schema: { $ref: '#/components/schemas/SubscriptionsResponse' },
-                },
-              },
-            },
-            '400': { description: 'Invalid parameters' },
-            '429': { description: 'Rate limit exceeded' },
-          },
-        },
-      },
-      '/payments/{merchant}': {
-        get: {
-          summary: 'List payment history for a merchant',
-          tags: ['Payments'],
-          parameters: [
-            {
-              in: 'path',
-              name: 'merchant',
-              required: true,
-              schema: { type: 'string' },
-            },
-            {
-              in: 'query',
-              name: 'event_type',
-              schema: {
-                type: 'string',
-                enum: ['executed', 'failure', 'cancel'],
-              },
-            },
-            {
-              in: 'query',
-              name: 'subscriber',
-              schema: { type: 'string' },
-            },
-            {
-              in: 'query',
-              name: 'from',
-              schema: { type: 'string', format: 'date-time' },
-            },
-            {
-              in: 'query',
-              name: 'to',
-              schema: { type: 'string', format: 'date-time' },
-            },
-            {
-              in: 'query',
-              name: 'page',
-              schema: { type: 'integer', minimum: 1, default: 1 },
-            },
-            {
-              in: 'query',
-              name: 'pageSize',
-              schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
-            },
-          ],
-          responses: {
-            '200': {
-              description: 'Payment history (JSON or CSV)',
-              content: {
-                'application/json': {
-                  schema: { $ref: '#/components/schemas/PaymentsResponse' },
-                },
-                'text/csv': { schema: { type: 'string' } },
-              },
-            },
-            '400': { description: 'Invalid parameters' },
-          },
-        },
-      },
-    },
-  };
-
-  app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
-
-  // Feature routes
-  app.use('/', createSubscriptionsRouter());
-  app.use('/', createPaymentsRouter());
-
-  // Generic error handler
-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-    console.error('[App] Unhandled error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  });
-
-  return app;
+export interface MigrationStatus {
+  hasPending: boolean;
+  pendingCount: number;
+  error?: string;
 }
 
-// ---------------------------------------------------------------------------
-// Bootstrap — only executed when this file is the entry point
-// ---------------------------------------------------------------------------
+/**
+ * Checks for pending database migrations by comparing migration files on disk
+ * against applied records in the _prisma_migrations table.
+ * Never throws — errors are captured in the `error` field.
+ */
+export async function checkPendingMigrations(): Promise<MigrationStatus> {
+  try {
+    const fs = await import('fs');
+    const path = await import('path');
+    const migrationsDir = path.resolve(__dirname, '../../migrations');
 
-if (require.main === module) {
-  const PORT = parseInt(process.env.PORT ?? '3001', 10);
+    if (!fs.existsSync(migrationsDir)) {
+      return { hasPending: false, pendingCount: 0 };
+    }
 
-  const app = createApp();
-  const server = app.listen(PORT, () => {
-    console.log(`[App] SorobanPay backend listening on port ${PORT}`);
-  });
+    const migrationFiles: string[] = fs
+      .readdirSync(migrationsDir)
+      .filter((f: string) => f.endsWith('.js') || f.endsWith('.sql'))
+      .sort();
 
-  const rpcUrl = process.env.SOROBAN_RPC_URL ?? 'https://soroban-testnet.stellar.org';
-  const contractId = process.env.CONTRACT_ID ?? '';
-  const pollIntervalMs = parseInt(process.env.POLL_INTERVAL_MS ?? '300000', 10);
+    if (migrationFiles.length === 0) {
+      return { hasPending: false, pendingCount: 0 };
+    }
 
-  const indexer = new IndexerService({ rpcUrl, contractId, pollIntervalMs });
-  const webhookWorker = new WebhookWorker();
+    let appliedNames: string[] = [];
+    try {
+      const prismaModule = await import('./lib/prisma');
+      const prismaClient = prismaModule.default;
+      const rows = await prismaClient.$queryRaw<{ migration_name: string }[]>`
+        SELECT migration_name FROM "_prisma_migrations"
+        WHERE finished_at IS NOT NULL
+      `;
+      appliedNames = rows.map((r) => r.migration_name);
+    } catch {
+      // Table absent on first deploy — treat all files as pending
+      return { hasPending: true, pendingCount: migrationFiles.length };
+    }
 
-  indexer.start();
-  webhookWorker.start();
+    const pendingCount = migrationFiles.filter(
+      (f: string) =>
+        !appliedNames.some(
+          (name) =>
+            f.startsWith(name) || name.startsWith(f.replace(/\.(js|sql)$/, '')),
+        ),
+    ).length;
 
-  const shutdown = async () => {
-    console.log('[App] Shutting down...');
-    indexer.stop();
-    webhookWorker.stop();
-    server.close(async () => {
-      await closePool();
-      process.exit(0);
+    return { hasPending: pendingCount > 0, pendingCount };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { hasPending: false, pendingCount: 0, error: message };
+  }
+}
+
+/**
+ * Migration startup guard:
+ *  - MIGRATE_ON_START=true  → run `prisma migrate deploy` before server starts
+ *  - otherwise              → warn about pending migrations, never auto-apply
+ */
+async function runMigrationGuard(): Promise<void> {
+  const status = await checkPendingMigrations();
+
+  if (status.error) {
+    console.warn(`[migrations] Migration check error: ${status.error}`);
+    return;
+  }
+
+  if (!status.hasPending) {
+    console.log('[migrations] Database schema is up to date.');
+    return;
+  }
+
+  if (process.env.MIGRATE_ON_START === 'true') {
+    console.log(
+      `[migrations] MIGRATE_ON_START=true — applying ${status.pendingCount} pending migration(s)...`,
+    );
+    const { execSync } = await import('child_process');
+    try {
+      execSync('npx prisma migrate deploy', { stdio: 'inherit', cwd: process.cwd() });
+      console.log('[migrations] Migrations applied successfully.');
+    } catch {
+      // Do not expose connection details in the log
+      throw new Error('[migrations] Startup migration failed. Check DB connectivity.');
+    }
+  } else {
+    console.warn(
+      `[migrations] WARNING: ${status.pendingCount} pending migration(s) detected. ` +
+        'Set MIGRATE_ON_START=true to apply automatically, or run ' +
+        '`npx prisma migrate deploy` manually before starting the server.',
+    );
+  }
+}
+
+// ─── Config ─────────────────────────────────────────────────────────────────
+const config = validateConfig();
+const { port: PORT, rpcUrl, contractId } = config;
+
+// ─── App ─────────────────────────────────────────────────────────────────────
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+// Dynamic tenant middleware
+try {
+  const { tenantAuthMiddleware } = require('./middleware/tenantAuth');
+  if (tenantAuthMiddleware) app.use(tenantAuthMiddleware);
+} catch (e) {}
+
+app.use(apiLimiter);
+app.use(versionMiddleware);   // BE-69: attach version info + deprecation headers
+
+// Dynamic extended health check routes (GET /health, /health/ready, /health/live)
+try {
+  const { extendedHealthRouter } = require('./routes/extendedHealth');
+  if (extendedHealthRouter) {
+    app.use('/', extendedHealthRouter);
+  }
+} catch (e) {}
+
+// Dynamic GraphQL endpoint (/graphql)
+try {
+  const { handleGraphQLRequest } = require('./graphql/server');
+  if (handleGraphQLRequest) {
+    app.use('/graphql', handleGraphQLRequest);
+  }
+} catch (e) {}
+
+// Dynamic Tenant Admin Router
+try {
+  const { tenantAdminRouter } = require('./routes/adminTenants');
+  if (tenantAdminRouter) {
+    app.use('/v1/admin', tenantAdminRouter);
+  }
+} catch (e) {}
+
+// ─── Version manifest ────────────────────────────────────────────────────────
+// GET /  →  version manifest
+app.use('/', versionRouter);
+
+// ─── Health (unversioned) ────────────────────────────────────────────────────
+app.use('/health', buildHealthRouter(rpcUrl, contractId));
+
+// ─── Versioned routes — /api/v1/ ─────────────────────────────────────────────
+app.use('/api/v1/auth',          authRouter);                             // BE-55: unauthenticated
+app.use('/api/v1/subscriptions', requireMerchant, subscriptionsRouter);  // BE-55: protected
+app.use('/api/v1/subscriptions/:subscriber/:merchant/retries', retriesRouter);
+app.use('/api/v1/webhooks',      webhooksRouter);
+app.use('/api/v1/summaries',     summariesRouter);
+app.use('/api/v1/reconcile',     reconcileRouter);
+app.use('/api/v1/notifications', notificationsRouter);  // BE-68
+app.use('/api/v1/admin',         adminRouter);          // BE-75: admin dashboard
+app.use('/api/v1/analytics',     requireMerchant, analyticsRouter);  // FE-50: revenue analytics
+app.use('/api/v1/reports',       requireMerchant, reportsRouter);    // BE-58 / #798: payment reports export
+
+// ─── Prometheus metrics (unauthenticated — restrict to internal network) ─────
+app.get('/metrics', (_req, res) => {
+  res.set('Content-Type', 'text/plain; version=0.0.4');
+  res.send(getPrometheusMetrics());
+});
+
+// ─── Backward-compatible aliases — /api/ (no version prefix) ─────────────────
+app.use('/api/subscriptions', subscriptionsRouter);
+app.use('/api/subscriptions/:subscriber/:merchant/retries', retriesRouter);
+app.use('/api/webhooks',      webhooksRouter);
+app.use('/api/summaries',     summariesRouter);
+app.use('/api/reconcile',     reconcileRouter);
+app.use('/api/notifications', notificationsRouter);
+app.use('/api/analytics',     analyticsRouter);        // FE-50: backward-compat alias
+app.use('/api/reports',       reportsRouter);          // BE-58 / #798: backward-compat alias
+
+// GET /api  →  same version manifest
+app.use('/api', versionRouter);
+
+// ─── Services ────────────────────────────────────────────────────────────────
+const networkPassphrase = process.env.NETWORK_PASSPHRASE ?? 'Test SDF Network ; September 2015';
+const eventIndexer      = new EventIndexer(rpcUrl, contractId);
+const summaryGenerator  = new PayoutSummaryGenerator();
+
+const operatorSecret = process.env.OPERATOR_SECRET;
+const paymentScheduler = operatorSecret
+  ? new PaymentScheduler(rpcUrl, contractId, operatorSecret, networkPassphrase)
+  : null;
+
+// ─── Retry infrastructure ─────────────────────────────────────────────────────
+const retryScheduler = createRetryScheduler(rpcUrl, contractId, operatorSecret, networkPassphrase);
+if (retryScheduler) {
+  // Inject into eventIndexer so payment_transfer_failure events trigger retries
+  eventIndexer.setRetryScheduler(retryScheduler);
+} else {
+  console.warn('[retry] OPERATOR_SECRET not set — automated payment retries disabled.');
+}
+
+// ─── Cron jobs ───────────────────────────────────────────────────────────────
+cron.schedule('*/5 * * * *', async () => {
+  console.log('[cron] Fetching new events...');
+  await eventIndexer.fetchAndStoreEvents();
+});
+
+cron.schedule('* * * * *', async () => {
+  if (!paymentScheduler) return;
+  await paymentScheduler.processDuePayments();
+});
+
+// Process due retry jobs every minute
+cron.schedule('* * * * *', async () => {
+  await retryQueue.processDueJobs();
+});
+
+// Generate daily summaries at 1 AM every day
+cron.schedule('0 1 * * *', async () => {
+  console.log('[cron] Generating daily summaries...');
+  await summaryGenerator.generateDailySummaries();
+});
+
+cron.schedule('0 2 * * 0', async () => {
+  console.log('[cron] Generating weekly summaries...');
+  await summaryGenerator.generateWeeklySummaries();
+});
+
+cron.schedule('0 * * * *', async () => {
+  console.log('[cron] Running reconciliation...');
+  try {
+    const [chainEvents, db] = await Promise.all([
+      fetchChainEventsFromDB(),
+      PrismaSubscriptionDB.load(),
+    ]);
+    const { repairs, errors } = reconcile(chainEvents, db);
+    console.log(`[cron] Reconciliation complete: ${repairs.length} repairs, ${errors.length} errors`);
+    if (errors.length > 0) console.warn('[cron] Reconciliation errors:', errors);
+  } catch (err) {
+    console.error('[cron] Reconciliation error:', err);
+  }
+});
+
+// #733: Process scheduled push notifications every minute
+cron.schedule('* * * * *', async () => {
+  await processScheduledNotifications().catch(err =>
+    console.error('[cron] Scheduled push notifications error:', err)
+  );
+});
+
+// ─── Start ───────────────────────────────────────────────────────────────────
+// Run migration guard before accepting traffic (#1078)
+runMigrationGuard()
+  .catch((err: Error) => {
+    console.error('[migrations] Fatal startup error:', err.message);
+  })
+  .finally(() => {
+    app.listen(PORT, () => {
+      console.log(`[server] SorobanPay backend running on port ${PORT}`);
+      if (!operatorSecret) {
+        console.warn('[scheduler] OPERATOR_SECRET not set — payment scheduler disabled.');
+      }
+      try {
+        startRetryWorker();
+      } catch (err) {
+        console.warn('[retryWorker] Could not start retry worker (Redis unavailable?):', err);
+      }
+      eventIndexer.fetchAndStoreEvents();
     });
-  };
+  });
 
-  process.on('SIGTERM', () => void shutdown());
-  process.on('SIGINT', () => void shutdown());
-}
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
+process.on('SIGTERM', async () => {
+  console.log('[server] SIGTERM received — shutting down gracefully...');
+  eventIndexer.stopPolling();   // BE-51: stop cursor-based polling
+  await shutdownRetryWorker();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('[server] SIGINT received — shutting down gracefully...');
+  eventIndexer.stopPolling();
+  await shutdownRetryWorker();
+  process.exit(0);
+});
+
+export default app;
