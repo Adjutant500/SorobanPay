@@ -2595,3 +2595,102 @@ fn test_batch_failed_item_next_payment_not_advanced() {
     assert_eq!(t.mer_bal(), 0_i128,
         "merchant balance must be unchanged after a failed batch item");
 }
+
+// ─── Issue #1359 — EmptyBatch (22) and BatchTooLarge (23) ────────────────────
+//
+// `batch_execute_payment` must validate the subscribers vector before any
+// processing.  An empty vector must immediately return EmptyBatch (22) and a
+// vector with more than BATCH_MAX_SIZE (50) entries must return BatchTooLarge (23).
+
+/// [1359-001] Empty subscribers vector must return EmptyBatch (22).
+///
+/// The guard fires before any storage reads, preventing a misleading
+/// batch_execute_initiated event from being emitted on a no-op call.
+#[test]
+fn test_batch_empty_returns_empty_batch_error_code_22() {
+    let t = T::new();
+    let empty: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&t.env);
+    let r = t.client().try_batch_execute_payment(&t.merchant, &t.token, &empty);
+    assert!(
+        matches!(r, Err(Ok(ContractError::EmptyBatch))),
+        "empty batch must return EmptyBatch (22); got {:?}",
+        r
+    );
+}
+
+/// [1359-002] Batch with BATCH_MAX_SIZE + 1 entries must return BatchTooLarge (23).
+///
+/// Off-by-one guard: exactly 51 entries (one over the limit of 50) must be
+/// rejected before any per-subscriber processing begins.
+#[test]
+fn test_batch_too_large_returns_batch_too_large_error_code_23() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    env.ledger().with_mut(|l| l.timestamp = 1_700_000_000_u64);
+
+    let admin    = Address::generate(&env);
+    let token    = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let merchant = Address::generate(&env);
+
+    let contract_id = env.register(SubscriptionProtocol, ());
+    let client      = SubscriptionProtocolClient::new(&env, &contract_id);
+
+    // Build a vector of BATCH_MAX_SIZE + 1 = 51 addresses.
+    let mut subscribers = soroban_sdk::Vec::new(&env);
+    for _ in 0..=crate::BATCH_MAX_SIZE {
+        subscribers.push_back(Address::generate(&env));
+    }
+
+    let r = client.try_batch_execute_payment(&merchant, &token, &subscribers);
+    assert!(
+        matches!(r, Err(Ok(ContractError::BatchTooLarge))),
+        "batch of 51 must return BatchTooLarge (23); got {:?}",
+        r
+    );
+}
+
+/// [1359-003] Batch of exactly BATCH_MAX_SIZE (50) must not be rejected.
+///
+/// Boundary regression guard: the size check uses `> BATCH_MAX_SIZE` so that
+/// exactly 50 subscribers is the inclusive maximum.
+#[test]
+fn test_batch_exactly_50_not_rejected_by_size_guard() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    env.ledger().with_mut(|l| l.timestamp = 1_700_000_000_u64);
+
+    let admin    = Address::generate(&env);
+    let token    = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let merchant = Address::generate(&env);
+
+    let contract_id = env.register(SubscriptionProtocol, ());
+    let client      = SubscriptionProtocolClient::new(&env, &contract_id);
+
+    let amt = 100_i128;
+    let ivl = 86_400_u64;
+
+    // Subscribe exactly BATCH_MAX_SIZE (50) accounts.
+    let mut subscribers = soroban_sdk::Vec::new(&env);
+    for _ in 0..crate::BATCH_MAX_SIZE {
+        let sub = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&sub, &10_000_i128);
+        token::Client::new(&env, &token).approve(
+            &sub,
+            &contract_id,
+            &5_000_i128,
+            &(env.ledger().sequence() + 100_000_u32),
+        );
+        client.subscribe(&sub, &merchant, &token, &amt, &ivl, &false);
+        subscribers.push_back(sub);
+    }
+
+    // Advance past the payment window.
+    let now = env.ledger().timestamp();
+    env.ledger().with_mut(|l| l.timestamp = now + ivl + 1);
+
+    let r = client.try_batch_execute_payment(&merchant, &token, &subscribers);
+    assert!(
+        !matches!(r, Err(Ok(ContractError::BatchTooLarge))),
+        "batch of exactly BATCH_MAX_SIZE (50) must not return BatchTooLarge"
+    );
+}
